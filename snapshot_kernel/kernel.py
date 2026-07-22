@@ -22,6 +22,78 @@ MAX_REPR_SIZE = 1_000_000  # 1 MB hard limit for any single MIME representation
 _TRUNCATION_MARKER = "\n... [truncated]"
 
 
+class ObservableNamespace(dict):
+    """A namespace dict that records which top-level symbols are read.
+
+    Used as the exec/eval namespace so that reads of top-level names
+    (LOAD_NAME / LOAD_GLOBAL) are captured via ``__getitem__``.  Only symbols
+    that were present in the namespace before execution began are reported, so
+    that ``get_inspected_symbols`` returns true pre-existing dependencies
+    rather than names the executed code itself defined.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._inspected_symbols = set()
+        self._original_symbols = set()
+
+    def __getitem__(self, key):
+        # Look up first: a KeyError (e.g. for a builtin name not in the
+        # namespace) propagates without recording, so builtins are excluded.
+        value = super().__getitem__(key)
+        self._inspected_symbols.add(key)
+        return value
+
+    def clear_inspected_symbols(self):
+        """Reset recorded symbols and snapshot the symbols present now.
+
+        Called right before execution, so ``_original_symbols`` captures the
+        namespace as it was before the cell ran (the source-state variables).
+        """
+        self._inspected_symbols = set()
+        self._original_symbols = set(self.keys())
+
+    def get_inspected_symbols(self):
+        """Return accessed symbols that were present before execution.
+
+        Only names in the pre-execution namespace are reported (true
+        dependencies).  Excludes dunder names and the injected ``display``
+        helper.  If the startup self-check found interception unreliable on
+        this interpreter, falls back to returning ALL originally-present
+        symbols (fail-safe: over-report rather than miss a dependency).
+        """
+        if _OBSERVABLE_SUPPORTED:
+            symbols = self._inspected_symbols & self._original_symbols
+        else:
+            symbols = set(self._original_symbols)
+        return sorted(
+            k for k in symbols
+            if not (k.startswith("__") and k.endswith("__")) and k != "display"
+        )
+
+
+def _probe_observable_namespace():
+    """Return True iff ``ObservableNamespace`` reliably captures top-level reads.
+
+    Runs ``x = x + 1`` in a namespace seeded with x=0, y=0 and requires the
+    recorded set to be exactly ``{"x"}`` -- it reads x (and captures it), not y.
+    On interpreters where dict-subclass ``__getitem__`` interception does not
+    fire for global name resolution, this returns False and callers fall back
+    to conservative over-reporting.
+    """
+    ns = ObservableNamespace({"x": 0, "y": 0, "__builtins__": __builtins__})
+    ns.clear_inspected_symbols()
+    try:
+        exec(compile("x = x + 1", "<probe>", "exec"), ns)
+    except Exception:
+        return False
+    return ns._inspected_symbols == {"x"}
+
+
+# Safe default; upgraded to True by the probe when interception is reliable.
+_OBSERVABLE_SUPPORTED = False
+_OBSERVABLE_SUPPORTED = _probe_observable_namespace()
+
 
 def _snapshot_namespace(namespace):
     """Create a snapshot of a namespace dict.
@@ -379,8 +451,12 @@ class SnapshotKernel:
         """Execute code in the given namespace with full output capture.
 
         The namespace must already contain ``__builtins__``.
-        Returns a dict with keys: output, error, namespace.
+        Returns a dict with keys: output, error, namespace, accessed_symbols.
         """
+        # Use an observable namespace so top-level symbol reads are recorded.
+        if not isinstance(namespace, ObservableNamespace):
+            namespace = ObservableNamespace(namespace)
+
         # Register this execution for possible interruption.
         with self._exec_lock:
             self._executions[exec_id] = threading.current_thread().ident
@@ -413,6 +489,10 @@ class SnapshotKernel:
         output = []
         error = None
         last_expr_value = None
+
+        # Reset symbol tracking and snapshot the pre-execution namespace, so
+        # only the user code's reads of pre-existing symbols are recorded.
+        namespace.clear_inspected_symbols()
 
         try:
             # Parse the code and split out the last expression if applicable.
@@ -498,12 +578,13 @@ class SnapshotKernel:
             "output": output,
             "error": error,
             "namespace": namespace,
+            "accessed_symbols": namespace.get_inspected_symbols(),
         }
 
     def execute(self, code, exec_id, state_name, new_state_name=None):
         """Execute code against a state and store the resulting state.
 
-        Returns a dict with keys: output, state_name, error.
+        Returns a dict with keys: output, state_name, error, accessed_symbols.
         """
         if new_state_name is None:
             new_state_name = uuid.uuid4().hex
@@ -516,6 +597,7 @@ class SnapshotKernel:
                 "output": [],
                 "state_name": None,
                 "error": {"ename": "StateNotFound", "evalue": state_name, "traceback": []},
+                "accessed_symbols": [],
             }
         namespace = _snapshot_namespace(source.namespace)
         namespace["__builtins__"] = __builtins__
@@ -535,6 +617,7 @@ class SnapshotKernel:
             "output": result["output"],
             "state_name": result_state_name,
             "error": result["error"],
+            "accessed_symbols": result["accessed_symbols"],
         }
 
     def multistate_execute(self, code, exec_id, state_mapping,
@@ -550,9 +633,11 @@ class SnapshotKernel:
         instead of ``alias.x``).
 
         No new state is stored.
-        Returns a dict with keys: output, state_name (always None), error.
+        Returns a dict with keys: output, state_name (always None), error,
+        accessed_symbols.
         """
-        _not_found = {"output": [], "state_name": None, "error": None}
+        _not_found = {"output": [], "state_name": None, "error": None,
+                      "accessed_symbols": []}
 
         # Look up and snapshot all states under a single lock.
         with self._lock:
@@ -594,6 +679,7 @@ class SnapshotKernel:
             "output": result["output"],
             "state_name": None,
             "error": result["error"],
+            "accessed_symbols": result["accessed_symbols"],
         }
 
     def interrupt(self, exec_id):

@@ -19,6 +19,7 @@ The main methods that the kernel should implement are:
     * `output`: The output of the execution, if any, as a list in the same format as the output of a Jupyter notebook cell execution.
     * `state_name`: The name of the state after execution.
     * `error`: Any error that occurred during execution, if applicable.
+    * `accessed_symbols`: The list of top-level variable names that were present in the state before execution and were read during the execution (the cell's dependencies on pre-existing variables), e.g. `["df", "x"]`. Names the cell itself defines are not included. On interpreters where read-tracking cannot be relied upon, this conservatively lists all pre-existing symbols. `multistate_execute` returns this same `accessed_symbols` key.
 
 * `get_state(state_name: str) -> dict`: Retrieves the state associated with the given name. The state should include all variables and imported modules at that point in execution.
 
