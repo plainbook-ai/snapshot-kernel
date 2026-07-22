@@ -314,3 +314,40 @@ def test_multistate_execute_default_state(server):
     expr_items = [o for o in body["output"]
                   if o["output_type"] == "execute_result"]
     assert expr_items[0]["data"]["text/plain"] == "105"
+
+
+def test_symbol_hashes_endpoint(server):
+    """POST /symbol_hashes returns per-symbol hashes, with 400/404 on bad input."""
+    _request(server, "POST", "/execute", {
+        "code": "a = 10\nb = [1, 2, 3]",
+        "exec_id": "e1",
+        "state_name": "initial",
+        "new_state_name": "s",
+    })
+
+    # Happy path: present symbols get hex digests, absent ones are null.
+    status, body = _request(server, "POST", "/symbol_hashes", {
+        "state_name": "s",
+        "symbols": ["a", "b", "missing"],
+    })
+    assert status == 200
+    hashes = body["hashes"]
+    assert len(hashes["a"]) == 64
+    assert len(hashes["b"]) == 64
+    assert hashes["missing"] is None
+
+    # Missing 'symbols' field -> 400.
+    status, _ = _request(server, "POST", "/symbol_hashes", {"state_name": "s"})
+    assert status == 400
+
+    # Unsupported hash_algo -> 400.
+    status, _ = _request(server, "POST", "/symbol_hashes", {
+        "state_name": "s", "symbols": ["a"], "hash_algo": "partial",
+    })
+    assert status == 400
+
+    # Unknown state -> 404.
+    status, _ = _request(server, "POST", "/symbol_hashes", {
+        "state_name": "nope", "symbols": ["a"],
+    })
+    assert status == 404

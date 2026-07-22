@@ -23,6 +23,8 @@ The main methods that the kernel should implement are:
 
 * `get_state(state_name: str) -> dict`: Retrieves the state associated with the given name. The state should include all variables and imported modules at that point in execution.
 
+* `get_symbol_hashes(state_name: str, symbols: List[str], hash_algo: Optional[str] = None) -> dict`: Returns a dict mapping each requested symbol to a stable content hash of its value in the given state, used to detect whether symbols changed between states. `hash_algo` selects the strategy; currently only `"full"` is supported (the default when `None`), which hashes the full value (pickled bytes, SHA-256). Symbols absent from the state map to `null`; returns `None` (HTTP 404) if the state does not exist. Exposed over HTTP as `POST /symbol_hashes` with body `{state_name, symbols, hash_algo?}`, returning `{"hashes": {...}}`.
+
 * `list_states() -> List[str]`: Returns a list of all state names currently stored in the kernel.
 
 * `delete_state(state_name: str)`: Deletes the state associated with the given name from the kernel.

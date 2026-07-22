@@ -54,6 +54,29 @@ def get_state(name):
     return json.dumps(state)
 
 
+@app.post("/symbol_hashes")
+def symbol_hashes():
+    """Return content hashes of symbols in a state."""
+    body = bottle.request.json
+    if not body:
+        bottle.abort(400, "Request body must be JSON.")
+    state_name = body.get("state_name")
+    symbols = body.get("symbols")
+    if state_name is None or symbols is None:
+        bottle.abort(400, "state_name and symbols are required.")
+    if not isinstance(symbols, list):
+        bottle.abort(400, "symbols must be a JSON list.")
+    hash_algo = body.get("hash_algo")
+    try:
+        result = kernel.get_symbol_hashes(state_name, symbols, hash_algo=hash_algo)
+    except ValueError as exc:
+        bottle.abort(400, str(exc))
+    if result is None:
+        bottle.abort(404, "State not found.")
+    bottle.response.content_type = "application/json"
+    return json.dumps({"hashes": result})
+
+
 @app.delete("/states/<name>")
 def delete_state(name):
     """Delete a state."""

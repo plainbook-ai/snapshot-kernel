@@ -9,8 +9,10 @@ import base64
 import copy
 import ctypes
 import datetime
+import hashlib
 import io
 import os
+import pickle
 import sys
 import threading
 import traceback
@@ -114,6 +116,24 @@ def _snapshot_namespace(namespace):
             except Exception:
                 snapshot[key] = value
     return snapshot
+
+
+def _hash_value(value):
+    """Return a stable SHA-256 hex digest of a value's full contents.
+
+    Pickles the value and hashes the bytes; this is deterministic across
+    processes and deep copies, and handles DataFrames, numpy arrays, etc.
+    Falls back to hashing repr() for unpicklable values; returns None if
+    even that fails.
+    """
+    try:
+        data = pickle.dumps(value)
+    except Exception:
+        try:
+            data = repr(value).encode("utf-8", "replace")
+        except Exception:
+            return None
+    return hashlib.sha256(data).hexdigest()
 
 
 def _configure_dataframe_display(max_rows, max_columns, max_colwidth):
@@ -405,6 +425,33 @@ class SnapshotKernel:
             "timestamp": state.timestamp,
             "variables": variables,
         }
+
+    def get_symbol_hashes(self, state_name, symbols, hash_algo=None):
+        """Return a dict mapping each requested symbol to a hash of its value.
+
+        Used to detect whether symbols changed value between states. *symbols*
+        is a list of top-level variable names. *hash_algo* selects the strategy;
+        currently only "full" is supported (the default when None), which hashes
+        the entire pickled value with SHA-256.
+
+        Symbols not present in the state map to None. Returns None if the state
+        does not exist. Raises ValueError for an unsupported hash_algo.
+        """
+        if hash_algo is None:
+            hash_algo = "full"
+        if hash_algo != "full":
+            raise ValueError(f"Unsupported hash_algo: {hash_algo}")
+        with self._lock:
+            state = self._states.get(state_name)
+        if state is None:
+            return None
+        result = {}
+        for sym in symbols:
+            if sym in state.namespace:
+                result[sym] = _hash_value(state.namespace[sym])
+            else:
+                result[sym] = None
+        return result
 
     def delete_state(self, state_name):
         """Remove the named state. Returns True if it existed."""

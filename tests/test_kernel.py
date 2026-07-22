@@ -574,3 +574,107 @@ def test_multistate_default_state_missing(kernel):
     assert result["error"] is not None
     assert result["error"]["ename"] == "StateNotFound"
     assert result["error"]["evalue"] == "no_such"
+
+
+# ------------------------------------------------------------------
+# Symbol hashing
+# ------------------------------------------------------------------
+
+# A setup cell defining a wide mix of value types, used across the
+# symbol-hashing tests.  Requires pandas (guarded by importorskip).
+_HASH_SETUP = (
+    "import pandas as pd\n"
+    "x = 5\n"
+    "f = 3.14159\n"
+    "nums = [1, 2, 3, 4, 5]\n"
+    "strs = ['alpha', 'beta', 'gamma']\n"
+    "bignums = list(range(100))\n"
+    "d = {'a': 1, 'b': [2, 3], 'c': {'nested': True}}\n"
+    "st = {10, 20, 30}\n"
+    "tup = (1, 'two', 3.0)\n"
+    "text = 'a string value'\n"
+    "flag = True\n"
+    "nothing = None\n"
+    "df1 = pd.DataFrame({'i': range(5), 'v': [1.5, 2.5, 3.5, 4.5, 5.5]})\n"
+    "df2 = pd.DataFrame({'name': ['a', 'b', 'c'], 'score': [90, 85, 77]})\n"
+)
+
+
+def test_symbol_hashes_stable_across_deepcopy(kernel):
+    """After ``x = x + 1``, only x's hash changes; every other symbol keeps
+    an identical hash despite the deepcopy that rebuilds the namespace (values
+    live at new memory addresses, but the content hash is address-independent).
+    """
+    pytest.importorskip("pandas")
+    r_s = kernel.execute(_HASH_SETUP, "e_setup", "initial", new_state_name="s")
+    assert r_s["error"] is None
+
+    r_t = kernel.execute("x = x + 1", "e_step", "s", new_state_name="t")
+    assert r_t["error"] is None
+
+    symbols = sorted(kernel.get_state("s")["variables"].keys())
+    hs = kernel.get_symbol_hashes("s", symbols)
+    ht = kernel.get_symbol_hashes("t", symbols)
+
+    # x was reassigned, so its hash must change.
+    assert hs["x"] != ht["x"]
+
+    # Every other symbol is unchanged across the deepcopy boundary.
+    for sym in symbols:
+        if sym == "x":
+            continue
+        assert hs[sym] is not None, f"no hash for {sym}"
+        assert hs[sym] == ht[sym], f"hash unexpectedly changed for {sym}"
+
+
+def test_symbol_hashes_basic(kernel):
+    """Present symbols hash to 64-char hex; absent symbols map to None; and
+    hashing is deterministic across repeated calls."""
+    kernel.execute("a = 10\nb = [1, 2, 3]", "e1", "initial", new_state_name="s")
+
+    result = kernel.get_symbol_hashes("s", ["a", "b", "missing"])
+    assert set(result.keys()) == {"a", "b", "missing"}
+    for sym in ("a", "b"):
+        assert isinstance(result[sym], str)
+        assert len(result[sym]) == 64
+    assert result["missing"] is None
+
+    # Deterministic: same state, same symbols -> same hashes.
+    assert kernel.get_symbol_hashes("s", ["a", "b"]) == {
+        "a": result["a"], "b": result["b"],
+    }
+
+
+def test_symbol_hashes_detects_changes(kernel):
+    """Mutating a value changes its hash; untouched values keep theirs."""
+    pytest.importorskip("pandas")
+    kernel.execute(
+        "import pandas as pd\n"
+        "keep = [1, 2, 3]\n"
+        "lst = [1, 2, 3]\n"
+        "df = pd.DataFrame({'v': [1, 2, 3]})\n",
+        "e1", "initial", new_state_name="s",
+    )
+    kernel.execute(
+        "lst.append(4)\ndf.loc[0, 'v'] = 99", "e2", "s", new_state_name="t"
+    )
+
+    hs = kernel.get_symbol_hashes("s", ["keep", "lst", "df"])
+    ht = kernel.get_symbol_hashes("t", ["keep", "lst", "df"])
+    assert hs["keep"] == ht["keep"]
+    assert hs["lst"] != ht["lst"]
+    assert hs["df"] != ht["df"]
+
+
+def test_symbol_hashes_state_not_found(kernel):
+    """Hashing symbols of a nonexistent state returns None."""
+    assert kernel.get_symbol_hashes("nope", ["a"]) is None
+
+
+def test_symbol_hashes_unsupported_algo(kernel):
+    """An unsupported hash_algo raises ValueError; None defaults to 'full'."""
+    kernel.execute("a = 1", "e1", "initial", new_state_name="s")
+    with pytest.raises(ValueError):
+        kernel.get_symbol_hashes("s", ["a"], hash_algo="partial")
+    assert kernel.get_symbol_hashes("s", ["a"]) == \
+        kernel.get_symbol_hashes("s", ["a"], hash_algo="full")
