@@ -35,9 +35,13 @@ class ObservableNamespace(dict):
     """
 
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+        # Initialise tracking sets before super().__init__ so that a
+        # __setitem__ during construction (if any) never hits a missing attr.
         self._inspected_symbols = set()
         self._original_symbols = set()
+        self._modified = set()
+        self._deleted = set()
+        super().__init__(*args, **kwargs)
 
     def __getitem__(self, key):
         # Look up first: a KeyError (e.g. for a builtin name not in the
@@ -46,14 +50,28 @@ class ObservableNamespace(dict):
         self._inspected_symbols.add(key)
         return value
 
+    def __setitem__(self, key, value):
+        # Records top-level assignments (STORE_NAME/STORE_GLOBAL) during exec.
+        self._modified.add(key)
+        self._deleted.discard(key)
+        super().__setitem__(key, value)
+
+    def __delitem__(self, key):
+        # Records top-level deletions (DELETE_NAME/DELETE_GLOBAL) during exec.
+        self._deleted.add(key)
+        self._modified.discard(key)
+        super().__delitem__(key)
+
     def clear_inspected_symbols(self):
-        """Reset recorded symbols and snapshot the symbols present now.
+        """Reset recorded reads/writes/deletes and snapshot the symbols present now.
 
         Called right before execution, so ``_original_symbols`` captures the
         namespace as it was before the cell ran (the source-state variables).
         """
         self._inspected_symbols = set()
         self._original_symbols = set(self.keys())
+        self._modified = set()
+        self._deleted = set()
 
     def get_inspected_symbols(self):
         """Return accessed symbols that were present before execution.
@@ -73,28 +91,67 @@ class ObservableNamespace(dict):
             if not (k.startswith("__") and k.endswith("__")) and k != "display"
         )
 
+    def get_modified_symbols(self):
+        """Return the top-level symbols assigned during execution (best-effort).
+
+        Excludes dunder names and the injected ``display`` helper. Used to
+        identify a cell's output region; safety of any downstream optimization
+        does not rely on this being complete (see ``get_inspected_symbols``'s
+        fail-safe over-reporting of reads).
+        """
+        return sorted(
+            k for k in self._modified
+            if not (k.startswith("__") and k.endswith("__")) and k != "display"
+        )
+
+    def get_deleted_symbols(self):
+        """Return the top-level symbols deleted during execution (best-effort)."""
+        return sorted(
+            k for k in self._deleted
+            if not (k.startswith("__") and k.endswith("__")) and k != "display"
+        )
+
 
 def _probe_observable_namespace():
-    """Return True iff ``ObservableNamespace`` reliably captures top-level reads.
+    """Return True iff ``ObservableNamespace`` reliably captures reads/writes/deletes.
 
-    Runs ``x = x + 1`` in a namespace seeded with x=0, y=0 and requires the
-    recorded set to be exactly ``{"x"}`` -- it reads x (and captures it), not y.
-    On interpreters where dict-subclass ``__getitem__`` interception does not
+    Runs ``x = x + 1`` and ``del y`` in a namespace seeded with x=0, y=0 and
+    requires the recorded reads to be exactly ``{"x"}``, writes ``{"x"}`` and
+    deletes ``{"y"}``. On interpreters where dict-subclass interception does not
     fire for global name resolution, this returns False and callers fall back
-    to conservative over-reporting.
+    to conservative over-reporting of reads.
     """
     ns = ObservableNamespace({"x": 0, "y": 0, "__builtins__": __builtins__})
     ns.clear_inspected_symbols()
     try:
-        exec(compile("x = x + 1", "<probe>", "exec"), ns)
+        exec(compile("x = x + 1\ndel y", "<probe>", "exec"), ns)
     except Exception:
         return False
-    return ns._inspected_symbols == {"x"}
+    return (ns._inspected_symbols == {"x"}
+            and ns._modified == {"x"}
+            and ns._deleted == {"y"})
 
 
 # Safe default; upgraded to True by the probe when interception is reliable.
 _OBSERVABLE_SUPPORTED = False
 _OBSERVABLE_SUPPORTED = _probe_observable_namespace()
+
+
+def _snapshot_value(key, value, memo):
+    """Copy a single namespace value into a snapshot, using the shared *memo*.
+
+    Modules are stored by reference (and seeded into the memo so nested
+    references to them also stay by-ref); everything else is deep-copied with
+    the shared memo (so intra-namespace aliasing is preserved), falling back to
+    a direct reference for non-copyable values.
+    """
+    if isinstance(value, types.ModuleType):
+        memo[id(value)] = value              # keep modules by-ref even when nested
+        return value
+    try:
+        return copy.deepcopy(value, memo)
+    except Exception:
+        return value
 
 
 def _snapshot_namespace(namespace):
@@ -112,15 +169,118 @@ def _snapshot_namespace(namespace):
     for key, value in namespace.items():
         if key.startswith("__") and key.endswith("__"):
             continue
-        if isinstance(value, types.ModuleType):
-            snapshot[key] = value
-            memo[id(value)] = value          # keep modules by-ref even when nested
-        else:
-            try:
-                snapshot[key] = copy.deepcopy(value, memo)
-            except Exception:
-                snapshot[key] = value
+        snapshot[key] = _snapshot_value(key, value, memo)
     return snapshot
+
+
+def _user_items(namespace):
+    """The non-dunder (name, value) pairs of a namespace, excluding ``display``."""
+    return [
+        (k, v) for k, v in namespace.items()
+        if not (k.startswith("__") and k.endswith("__")) and k != "display"
+    ]
+
+
+class _AliasTrackingMemo(dict):
+    """A ``copy.deepcopy`` memo that also records cross-variable aliasing.
+
+    ``deepcopy`` calls ``memo.get(id(obj))`` before copying every object and
+    ``memo[id(obj)] = copy`` the first time it copies one. By tagging each
+    first insertion with the top-level variable currently being copied
+    (``owner``), a later ``get`` hit whose object was first inserted by a
+    *different* owner reveals that those two variables share that object -- i.e.
+    they alias. See ``Plans/alias_detection_strategy.md``.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.owner = None
+        self.first_owner = {}     # id(original) -> variable that first copied it
+        self.edges = set()        # {(var_a, var_b), ...} aliased pairs
+
+    def get(self, key, default=None):
+        if self.owner is not None and super().__contains__(key):
+            prev = self.first_owner.get(key)
+            if prev is not None and prev != self.owner:
+                self.edges.add(tuple(sorted((prev, self.owner))))
+        return super().get(key, default)
+
+    def __setitem__(self, key, value):
+        if self.owner is not None and key not in self.first_owner:
+            self.first_owner[key] = self.owner
+        super().__setitem__(key, value)
+
+
+def _alias_groups(namespace):
+    """Return the alias groups of a namespace as a list of sorted name lists.
+
+    Two top-level variables are in the same group iff their values share a
+    mutable object (directly or nested); only groups of size >= 2 are returned.
+    Detection piggybacks on a deepcopy with the tracking memo above.
+    """
+    memo = _AliasTrackingMemo()
+    for key, value in _user_items(namespace):
+        if isinstance(value, types.ModuleType):
+            memo[id(value)] = value
+            continue
+        memo.owner = key
+        try:
+            copy.deepcopy(value, memo)
+        except Exception:
+            pass
+    memo.owner = None
+
+    parent = {}
+
+    def find(a):
+        parent.setdefault(a, a)
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    for a, b in memo.edges:
+        parent[find(a)] = find(b)
+
+    groups = {}
+    for name, _ in _user_items(namespace):
+        groups.setdefault(find(name), set()).add(name)
+    return [sorted(g) for g in groups.values() if len(g) > 1]
+
+
+def _group_fingerprint(names, namespace):
+    """A hash of a group's ``(name, value)`` pairs serialized *together*.
+
+    Serializing the whole group under one pickle memo captures both the values
+    and the sharing *among* the group's members, so it changes when a
+    cross-variable alias appears or disappears even if no individual value
+    changes. For a single-name group this equals that value's own hash.
+    """
+    payload = [(n, namespace[n]) for n in sorted(names) if n in namespace]
+    try:
+        data = pickle.dumps(payload)
+    except Exception:
+        try:
+            data = repr(payload).encode("utf-8", "replace")
+        except Exception:
+            return None
+    return hashlib.sha256(data).hexdigest()
+
+
+def _alias_groups_and_fingerprints(namespace):
+    """Return (groups, fingerprints): every variable's group and its fingerprint.
+
+    Every non-dunder user variable appears in exactly one group (singletons
+    included), so the fingerprint list is a complete change-detection basis.
+    """
+    multi = _alias_groups(namespace)
+    grouped = {n for g in multi for n in g}
+    groups = [list(g) for g in multi]
+    for name, _ in _user_items(namespace):
+        if name not in grouped:
+            groups.append([name])            # singleton group
+    fingerprints = [_group_fingerprint(g, namespace) for g in groups]
+    return groups, fingerprints
 
 
 def _hash_value(value):
@@ -458,6 +618,59 @@ class SnapshotKernel:
                 result[sym] = None
         return result
 
+    def get_alias_groups(self, state_name):
+        """Return the alias groups of a state and each group's fingerprint.
+
+        Returns ``{"groups": [[names...], ...], "fingerprints": [hex, ...]}``
+        where every non-dunder user variable appears in exactly one group
+        (singletons included) and each fingerprint hashes its group's members
+        together, so it reflects both values and the sharing among members.
+        Returns None if the state does not exist.
+        """
+        with self._lock:
+            state = self._states.get(state_name)
+        if state is None:
+            return None
+        groups, fingerprints = _alias_groups_and_fingerprints(state.namespace)
+        return {"groups": groups, "fingerprints": fingerprints}
+
+    def rebuild_state(self, input_state, source_state, source_vars, input_vars,
+                      new_state_name=None):
+        """Reconstruct a successor state without executing code.
+
+        Builds a new state = the variables in *source_vars* copied from
+        *source_state* (the cell's previous successor) plus the variables in
+        *input_vars* copied from *input_state* (the current input). Each side is
+        copied under its own shared memo, so aliasing within each side is
+        preserved. The caller must guarantee the two sides are alias-disjoint
+        (they come from different alias groups), so no object straddles the seam.
+
+        Returns ``{"state_name": ..., "groups": ..., "fingerprints": ...}`` or
+        None if either source state is missing.
+        """
+        if new_state_name is None:
+            new_state_name = uuid.uuid4().hex
+        with self._lock:
+            src = self._states.get(source_state)
+            inp = self._states.get(input_state)
+            if src is None or inp is None:
+                return None
+            new_ns = {}
+            src_memo = {}
+            for name in source_vars:
+                if name in src.namespace:
+                    new_ns[name] = _snapshot_value(
+                        name, src.namespace[name], src_memo)
+            inp_memo = {}
+            for name in input_vars:
+                if name in inp.namespace and name not in new_ns:
+                    new_ns[name] = _snapshot_value(
+                        name, inp.namespace[name], inp_memo)
+            self._states[new_state_name] = State(new_state_name, new_ns)
+        groups, fingerprints = _alias_groups_and_fingerprints(new_ns)
+        return {"state_name": new_state_name,
+                "groups": groups, "fingerprints": fingerprints}
+
     def delete_state(self, state_name):
         """Remove the named state. Returns True if it existed."""
         with self._lock:
@@ -631,12 +844,15 @@ class SnapshotKernel:
             "error": error,
             "namespace": namespace,
             "accessed_symbols": namespace.get_inspected_symbols(),
+            "modified_symbols": namespace.get_modified_symbols(),
+            "deleted_symbols": namespace.get_deleted_symbols(),
         }
 
     def execute(self, code, exec_id, state_name, new_state_name=None):
         """Execute code against a state and store the resulting state.
 
-        Returns a dict with keys: output, state_name, error, accessed_symbols.
+        Returns a dict with keys: output, state_name, error, accessed_symbols,
+        modified_symbols, deleted_symbols.
         """
         if new_state_name is None:
             new_state_name = uuid.uuid4().hex
@@ -650,6 +866,8 @@ class SnapshotKernel:
                 "state_name": None,
                 "error": {"ename": "StateNotFound", "evalue": state_name, "traceback": []},
                 "accessed_symbols": [],
+                "modified_symbols": [],
+                "deleted_symbols": [],
             }
         namespace = _snapshot_namespace(source.namespace)
         namespace["__builtins__"] = __builtins__
@@ -670,6 +888,8 @@ class SnapshotKernel:
             "state_name": result_state_name,
             "error": result["error"],
             "accessed_symbols": result["accessed_symbols"],
+            "modified_symbols": result["modified_symbols"],
+            "deleted_symbols": result["deleted_symbols"],
         }
 
     def multistate_execute(self, code, exec_id, state_mapping,
@@ -689,7 +909,8 @@ class SnapshotKernel:
         accessed_symbols.
         """
         _not_found = {"output": [], "state_name": None, "error": None,
-                      "accessed_symbols": []}
+                      "accessed_symbols": [], "modified_symbols": [],
+                      "deleted_symbols": []}
 
         # Look up and snapshot all states under a single lock.
         with self._lock:
@@ -732,6 +953,8 @@ class SnapshotKernel:
             "state_name": None,
             "error": result["error"],
             "accessed_symbols": result["accessed_symbols"],
+            "modified_symbols": result["modified_symbols"],
+            "deleted_symbols": result["deleted_symbols"],
         }
 
     def interrupt(self, exec_id):

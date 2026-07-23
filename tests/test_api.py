@@ -351,3 +351,71 @@ def test_symbol_hashes_endpoint(server):
         "state_name": "nope", "symbols": ["a"],
     })
     assert status == 404
+
+
+def test_execute_reports_modified_and_deleted(server):
+    """POST /execute includes modified_symbols and deleted_symbols."""
+    _request(server, "POST", "/execute", {
+        "code": "keep = 1\ngone = 2", "exec_id": "e1",
+        "state_name": "initial", "new_state_name": "s0",
+    })
+    status, body = _request(server, "POST", "/execute", {
+        "code": "new = keep + 1\ndel gone", "exec_id": "e2", "state_name": "s0",
+    })
+    assert status == 200
+    assert body["modified_symbols"] == ["new"]
+    assert body["deleted_symbols"] == ["gone"]
+
+
+def test_alias_groups_endpoint(server):
+    """POST /alias_groups returns groups + fingerprints; 400/404 on bad input."""
+    _request(server, "POST", "/execute", {
+        "code": "a = [1]\nb = a\nlonely = [2]", "exec_id": "e1",
+        "state_name": "initial", "new_state_name": "s",
+    })
+    status, body = _request(server, "POST", "/alias_groups", {"state_name": "s"})
+    assert status == 200
+    multi = sorted(sorted(g) for g in body["groups"] if len(g) > 1)
+    assert multi == [["a", "b"]]
+    assert len(body["fingerprints"]) == len(body["groups"])
+
+    status, _ = _request(server, "POST", "/alias_groups", {})
+    assert status == 400
+    status, _ = _request(server, "POST", "/alias_groups", {"state_name": "nope"})
+    assert status == 404
+
+
+def test_rebuild_state_endpoint(server):
+    """POST /rebuild_state composes source_vars + input_vars; 400/404 on bad input."""
+    _request(server, "POST", "/execute", {
+        "code": "p = [1]\nq = p", "exec_id": "e1",
+        "state_name": "initial", "new_state_name": "src",
+    })
+    _request(server, "POST", "/execute", {
+        "code": "p = [0]\nq = [0]\nr = [8]", "exec_id": "e2",
+        "state_name": "initial", "new_state_name": "inp",
+    })
+    status, body = _request(server, "POST", "/rebuild_state", {
+        "input_state": "inp", "source_state": "src",
+        "source_vars": ["p", "q"], "input_vars": ["r"],
+        "new_state_name": "rebuilt",
+    })
+    assert status == 200
+    assert body["state_name"] == "rebuilt"
+
+    status, out = _request(server, "POST", "/execute", {
+        "code": "print(p, q, r, p is q)", "exec_id": "e3", "state_name": "rebuilt",
+    })
+    text = "".join(o["text"] for o in out["output"]
+                   if o.get("output_type") == "stream").strip()
+    assert text == "[1] [1] [8] True"
+
+    # Missing required fields -> 400.
+    status, _ = _request(server, "POST", "/rebuild_state", {"input_state": "inp"})
+    assert status == 400
+    # Unknown state -> 404.
+    status, _ = _request(server, "POST", "/rebuild_state", {
+        "input_state": "inp", "source_state": "nope",
+        "source_vars": [], "input_vars": ["r"],
+    })
+    assert status == 404

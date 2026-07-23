@@ -20,10 +20,16 @@ The main methods that the kernel should implement are:
     * `state_name`: The name of the state after execution.
     * `error`: Any error that occurred during execution, if applicable.
     * `accessed_symbols`: The list of top-level variable names that were present in the state before execution and were read during the execution (the cell's dependencies on pre-existing variables), e.g. `["df", "x"]`. Names the cell itself defines are not included. On interpreters where read-tracking cannot be relied upon, this conservatively lists all pre-existing symbols. `multistate_execute` returns this same `accessed_symbols` key.
+    * `modified_symbols`: The list of top-level variable names assigned during execution (the cell's writes), e.g. `["y"]`. Best-effort (dunder names and the injected `display` helper are excluded).
+    * `deleted_symbols`: The list of top-level variable names removed with `del` during execution.
 
 * `get_state(state_name: str) -> dict`: Retrieves the state associated with the given name. The state should include all variables and imported modules at that point in execution.
 
 * `get_symbol_hashes(state_name: str, symbols: List[str], hash_algo: Optional[str] = None) -> dict`: Returns a dict mapping each requested symbol to a stable content hash of its value in the given state, used to detect whether symbols changed between states. `hash_algo` selects the strategy; currently only `"full"` is supported (the default when `None`), which hashes the full value (pickled bytes, SHA-256). Symbols absent from the state map to `null`; returns `None` (HTTP 404) if the state does not exist. Exposed over HTTP as `POST /symbol_hashes` with body `{state_name, symbols, hash_algo?}`, returning `{"hashes": {...}}`.
+
+* `get_alias_groups(state_name: str) -> dict`: Returns `{"groups": [[names...], ...], "fingerprints": [hex, ...]}` — the alias groups of the state (maximal sets of top-level variables that share a mutable object, directly or nested) and, for each group, a fingerprint that hashes the group's members together (so it reflects both their values and the sharing among them). Every non-dunder user variable appears in exactly one group (singletons included). Returns `None` (HTTP 404) if the state does not exist. Exposed as `POST /alias_groups` with body `{state_name}`.
+
+* `rebuild_state(input_state: str, source_state: str, source_vars: List[str], input_vars: List[str], new_state_name: Optional[str] = None) -> dict`: Reconstructs a successor state *without executing code*: the variables in `source_vars` are copied from `source_state`, the variables in `input_vars` from `input_state`, each side under its own shared deepcopy memo (so aliasing within each side is preserved). The caller must guarantee the two sides are alias-disjoint. Returns `{state_name, groups, fingerprints}` for the new state, or `None` (HTTP 404) if either state is missing. Exposed as `POST /rebuild_state` with body `{input_state, source_state, source_vars, input_vars, new_state_name?}`.
 
 * `list_states() -> List[str]`: Returns a list of all state names currently stored in the kernel.
 

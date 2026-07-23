@@ -77,6 +77,45 @@ def symbol_hashes():
     return json.dumps({"hashes": result})
 
 
+@app.post("/alias_groups")
+def alias_groups():
+    """Return the alias groups of a state and each group's fingerprint."""
+    body = bottle.request.json
+    if not body:
+        bottle.abort(400, "Request body must be JSON.")
+    state_name = body.get("state_name")
+    if state_name is None:
+        bottle.abort(400, "state_name is required.")
+    result = kernel.get_alias_groups(state_name)
+    if result is None:
+        bottle.abort(404, "State not found.")
+    bottle.response.content_type = "application/json"
+    return json.dumps(result)
+
+
+@app.post("/rebuild_state")
+def rebuild_state():
+    """Reconstruct a successor state from source + input variables, no exec."""
+    body = bottle.request.json
+    if not body:
+        bottle.abort(400, "Request body must be JSON.")
+    input_state = body.get("input_state")
+    source_state = body.get("source_state")
+    source_vars = body.get("source_vars")
+    input_vars = body.get("input_vars")
+    if input_state is None or source_state is None:
+        bottle.abort(400, "input_state and source_state are required.")
+    if not isinstance(source_vars, list) or not isinstance(input_vars, list):
+        bottle.abort(400, "source_vars and input_vars must be JSON lists.")
+    result = kernel.rebuild_state(
+        input_state, source_state, source_vars, input_vars,
+        new_state_name=body.get("new_state_name"))
+    if result is None:
+        bottle.abort(404, "State not found.")
+    bottle.response.content_type = "application/json"
+    return json.dumps(result)
+
+
 @app.delete("/states/<name>")
 def delete_state(name):
     """Delete a state."""

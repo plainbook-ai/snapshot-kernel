@@ -725,3 +725,112 @@ def test_symbol_hashes_unsupported_algo(kernel):
         kernel.get_symbol_hashes("s", ["a"], hash_algo="partial")
     assert kernel.get_symbol_hashes("s", ["a"]) == \
         kernel.get_symbol_hashes("s", ["a"], hash_algo="full")
+
+
+# ------------------------------------------------------------------
+# Write / delete tracking
+# ------------------------------------------------------------------
+
+def test_modified_and_deleted_symbols(kernel):
+    """execute() reports assigned and deleted top-level symbols."""
+    kernel.execute("keep = 1\ngone = 2", "e1", "initial", new_state_name="s0")
+    r = kernel.execute(
+        "import math\nnew = keep + 1\nkeep = keep + 10\ndel gone",
+        "e2", "s0")
+    assert set(r["modified_symbols"]) == {"math", "new", "keep"}
+    assert r["deleted_symbols"] == ["gone"]
+    assert r["accessed_symbols"] == ["keep"]           # 'gone' del is not a read
+
+
+# ------------------------------------------------------------------
+# Alias groups + group fingerprints
+# ------------------------------------------------------------------
+
+def _group_with(result, name):
+    for grp, fp in zip(result["groups"], result["fingerprints"]):
+        if name in grp:
+            return tuple(sorted(grp)), fp
+    return None, None
+
+
+def test_alias_groups_direct_and_nested(kernel):
+    """Direct (b=a) and nested (x=[c]) sharing are detected; lonely vars are singletons."""
+    kernel.execute(
+        "a = [1]\nb = a\nc = [2]\nx = [c]\nlonely = [9]",
+        "e1", "initial", new_state_name="s")
+    ag = kernel.get_alias_groups("s")
+    multi = sorted(sorted(g) for g in ag["groups"] if len(g) > 1)
+    assert multi == [["a", "b"], ["c", "x"]]
+    # every variable appears in exactly one group, with a fingerprint each
+    flat = [n for g in ag["groups"] for n in g]
+    assert sorted(flat) == ["a", "b", "c", "lonely", "x"]
+    assert len(ag["fingerprints"]) == len(ag["groups"])
+    assert (["lonely"] in ag["groups"])                # singleton present
+
+
+def test_group_fingerprint_sees_cross_variable_sharing(kernel):
+    """A group fingerprint changes when cross-variable sharing flips, even though
+    each variable's value (and per-variable hash) is unchanged."""
+    # v1: a and b do NOT share their inner ['o3']; v2: they DO.
+    kernel.execute("O1=['o1']\nO2=['o2']\na=[O1,['o3']]\nb=[O2,['o3']]\nx=[O1,O2]",
+                   "e1", "initial", new_state_name="v1")
+    kernel.execute("O1=['o1']\nO2=['o2']\ns=['o3']\na=[O1,s]\nb=[O2,s]\nx=[O1,O2]",
+                   "e2", "initial", new_state_name="v2")
+    # per-variable hashes are identical
+    h1 = kernel.get_symbol_hashes("v1", ["a", "b", "x"])
+    h2 = kernel.get_symbol_hashes("v2", ["a", "b", "x"])
+    assert h1 == h2
+    # but the group fingerprint (which serialises the group together) differs
+    _, fp1 = _group_with(kernel.get_alias_groups("v1"), "x")
+    _, fp2 = _group_with(kernel.get_alias_groups("v2"), "x")
+    assert fp1 != fp2
+
+
+def test_singleton_fingerprint_matches_across_equal_states(kernel):
+    """A lonely variable's group fingerprint is stable when its value is unchanged."""
+    kernel.execute("a = [1, 2, 3]\nb = 5", "e1", "initial", new_state_name="s1")
+    kernel.execute("a = [1, 2, 3]\nb = 5", "e2", "initial", new_state_name="s2")
+    _, fa1 = _group_with(kernel.get_alias_groups("s1"), "a")
+    _, fa2 = _group_with(kernel.get_alias_groups("s2"), "a")
+    assert fa1 == fa2
+
+
+# ------------------------------------------------------------------
+# rebuild_state
+# ------------------------------------------------------------------
+
+def test_rebuild_state_composes_two_states(kernel):
+    """rebuild_state takes source_vars from source, input_vars from input, and
+    preserves aliasing within each side."""
+    kernel.execute("p = [1]\nq = p\nr = [9]", "e1", "initial", new_state_name="src")
+    kernel.execute("p = [0]\nq = [0]\nr = [8]\nextra = [7]",
+                   "e2", "initial", new_state_name="inp")
+    out = kernel.rebuild_state("inp", "src", ["p", "q"], ["r", "extra"],
+                               new_state_name="rebuilt")
+    assert out["state_name"] == "rebuilt"
+    r = kernel.execute(
+        "print(p, q, r, extra, p is q)", "e3", "rebuilt")
+    text = "".join(o["text"] for o in r["output"]
+                   if o.get("output_type") == "stream").strip()
+    # p,q from source (aliased, value [1]); r,extra from input
+    assert text == "[1] [1] [8] [7] True"
+
+
+def test_rebuild_state_missing_state(kernel):
+    """rebuild_state returns None if either state is missing."""
+    kernel.execute("a = 1", "e1", "initial", new_state_name="s")
+    assert kernel.rebuild_state("s", "nope", ["a"], []) is None
+    assert kernel.rebuild_state("nope", "s", [], ["a"]) is None
+
+
+def test_rebuild_state_reuses_state_name(kernel):
+    """rebuild_state can overwrite the source state name safely."""
+    kernel.execute("v = [1]", "e1", "initial", new_state_name="src")
+    kernel.execute("v = [2]\nw = [3]", "e2", "initial", new_state_name="inp")
+    # reuse 'src' as the new state name while sourcing 'v' from it
+    out = kernel.rebuild_state("inp", "src", ["v"], ["w"], new_state_name="src")
+    assert out["state_name"] == "src"
+    r = kernel.execute("print(v, w)", "e3", "src")
+    text = "".join(o["text"] for o in r["output"]
+                   if o.get("output_type") == "stream").strip()
+    assert text == "[1] [3]"
