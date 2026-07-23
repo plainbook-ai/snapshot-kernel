@@ -98,21 +98,26 @@ _OBSERVABLE_SUPPORTED = _probe_observable_namespace()
 
 
 def _snapshot_namespace(namespace):
-    """Create a snapshot of a namespace dict.
+    """Create an independent snapshot of a namespace dict.
 
-    Modules are stored by reference (they are singletons).
-    Everything else is deep-copied when possible, with a fallback
-    to storing a direct reference for non-copyable objects.
+    Uses a single shared deepcopy memo across all top-level variables so that
+    aliasing *within* the namespace (two variables referencing the same object,
+    directly or nested) is preserved -- matching standard Python semantics --
+    while the snapshot remains fully independent of the source. Modules are
+    stored by reference (they are singletons); non-copyable values fall back to
+    a direct reference.
     """
     snapshot = {}
+    memo = {}
     for key, value in namespace.items():
         if key.startswith("__") and key.endswith("__"):
             continue
         if isinstance(value, types.ModuleType):
             snapshot[key] = value
+            memo[id(value)] = value          # keep modules by-ref even when nested
         else:
             try:
-                snapshot[key] = copy.deepcopy(value)
+                snapshot[key] = copy.deepcopy(value, memo)
             except Exception:
                 snapshot[key] = value
     return snapshot

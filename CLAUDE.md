@@ -42,6 +42,8 @@ The kernel should be written in Python.  The Python code should be:
 
 Try to use the simplest code, using as few external (imported) modules as possible. 
 
+State snapshots preserve intra-state aliasing: the namespace is deep-copied with a single shared `copy.deepcopy` memo, so two variables that reference the same object (directly or nested) remain aliased within a state — matching standard Python semantics — while distinct states stay fully independent. Modules are stored by reference.
+
 The kernel execution itself should be separate from the server code described below, so at least a couple of Python files are necessary, a `main.py` for the bottle server, and a `kernel.py` for the kernel implementation. 
 
 Try to keep the implementation organized in a clean class structure. 

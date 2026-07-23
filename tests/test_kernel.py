@@ -186,6 +186,53 @@ def test_state_isolation(kernel):
 
 
 # ------------------------------------------------------------------
+# Aliasing semantics (snapshots preserve intra-state aliasing)
+# ------------------------------------------------------------------
+
+def test_cross_cell_aliasing_direct(kernel):
+    """Two variables bound to the same object stay aliased across cells."""
+    r1 = kernel.execute("a = [1]\nb = a", "e1", "initial")
+    r2 = kernel.execute("b.append(2)", "e2", r1["state_name"])
+    r3 = kernel.execute("print(a, b, a is b)", "e3", r2["state_name"])
+    stdout = "".join(o["text"] for o in r3["output"]
+                     if o.get("output_type") == "stream")
+    assert stdout.strip() == "[1, 2] [1, 2] True"
+
+
+def test_cross_cell_aliasing_nested(kernel):
+    """Nested aliasing (an object shared between a container and a top-level
+    variable) survives snapshotting: mutating it via one name is seen by both."""
+    r1 = kernel.execute(
+        "class C:\n    pass\nc = C()\nc.a = 1\nx = [c]", "e1", "initial")
+    r2 = kernel.execute("x[0].a = 2", "e2", r1["state_name"])
+    r3 = kernel.execute("print(c.a, x[0].a, x[0] is c)", "e3", r2["state_name"])
+    stdout = "".join(o["text"] for o in r3["output"]
+                     if o.get("output_type") == "stream")
+    assert stdout.strip() == "2 2 True"
+
+
+def test_state_independence_preserved(kernel):
+    """Mutating a shared container in a derived state does not affect the
+    parent state -- states remain immutable/independent under the shared memo."""
+    r1 = kernel.execute("a = [1]\nb = a", "e1", "initial", new_state_name="s1")
+    kernel.execute("b.append(2)", "e2", "s1", new_state_name="s2")
+    # s1 must be untouched.
+    r3 = kernel.execute("print(a)", "e3", "s1")
+    stdout = "".join(o["text"] for o in r3["output"]
+                     if o.get("output_type") == "stream")
+    assert stdout.strip() == "[1]"
+
+
+def test_equal_values_not_aliased(kernel):
+    """Equal-but-separate objects are not spuriously aliased after a round-trip."""
+    r1 = kernel.execute("p = [1, 2, 3]\nq = [1, 2, 3]", "e1", "initial")
+    r2 = kernel.execute("p.append(4)\nprint(p, q, p is q)", "e2", r1["state_name"])
+    stdout = "".join(o["text"] for o in r2["output"]
+                     if o.get("output_type") == "stream")
+    assert stdout.strip() == "[1, 2, 3, 4] [1, 2, 3] False"
+
+
+# ------------------------------------------------------------------
 # Interrupt
 # ------------------------------------------------------------------
 
