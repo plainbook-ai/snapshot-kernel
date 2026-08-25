@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "snapshot-kernel"
-version = "0.2.0"
+version = "0.2.1"
 description = "A snapshotting Python kernel with REST API"
 readme = "README.md"
 license = "BSD-3-Clause"
@@ -15,7 +15,7 @@ requires-python = ">=3.9"
 
 [project.urls]
 # Links displayed on the PyPI project page
-Homepage = "https://github.com/lucadealfaro/snapshot-kernel"
+Homepage = "https://github.com/plainbook-ai/snapshot-kernel"
 
 [project.optional-dependencies]
 test = ["pytest", "pandas"]
